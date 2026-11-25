@@ -188,7 +188,15 @@ pub fn combo(snapshot: &Value, provider: &str, model: &str, effort: &str, speed:
     let windows: Vec<Value> = if snapshot["provider"].as_str().is_some_and(|p| p != provider) { vec![] } else { snapshot["windows"].as_array().into_iter().flatten().filter_map(|w| {
         let used = w["used_permille"].as_f64().map(|p| p / 10.0).or_else(|| w["used_percent"].as_f64()).filter(|u| (0.0..=100.0).contains(u))?;
         let scope = w["scope"].as_str().unwrap_or("");
-        let label = w["label"].as_str().map(str::to_string).unwrap_or_else(|| match scope { "five_hour" => "5-hour".into(), "seven_day" | "shared" => "Weekly".into(), "seven_day_opus" | "opus" => "Opus weekly".into(), "seven_day_sonnet" | "sonnet" => "Sonnet weekly".into(), o => w["name"].as_str().unwrap_or(o).to_string() });
+        let label = w["label"].as_str().unwrap_or_else(|| match scope {
+            "five_hour" => "5-hour",
+            // Both Claude periods can have the shared scope. Stream and saved readings use different duration fields.
+            "shared" if provider == "claude" && (w["duration_minutes"] == 300 || w["window_minutes"] == 300) => "5-hour",
+            "seven_day" | "shared" => "Weekly",
+            "seven_day_opus" | "opus" => "Opus weekly",
+            "seven_day_sonnet" | "sonnet" => "Sonnet weekly",
+            other => w["name"].as_str().unwrap_or(other),
+        });
         let applies = match binds(w, &ml) { Some(b) => b, None => !matches!(scope, "opus" | "seven_day_opus") || ml.contains("opus") } && (!matches!(scope, "sonnet" | "seven_day_sonnet") || ml.contains("sonnet"));
         let reset = w["resets_at"].as_f64().map(|r| r as u64).filter(|r| *r > now_s);
         let l = ((100.0 - used).floor()).max(0.0) as u64;
@@ -666,18 +674,21 @@ mod tests {
     #[test] fn a_thread_reads_its_bound_accounts_numbers_or_the_cli_logins() {
         let mut st = State::new();
         st.apply(&json!({"$":"ThreadCreated","id":"t1","project":"p","title":"T","env":"local","branch":"","worktree":"","provider":"claude","model":"claude-opus-5-5","at":1}));
-        let inv = json!({"version":1,"revision":1,"profiles":[{"id":"k","provider":"claude","label":"alex@example.net","epoch":2,"state":"connected","identity":{"email":"alex@example.net"},"allowance":{"state":"ok","windows":[{"scope":"seven_day","label":"Weekly","used_percent":64.0}]}},
+        let inv = json!({"version":1,"revision":1,"profiles":[{"id":"k","provider":"claude","label":"alex@example.net","epoch":2,"state":"connected","identity":{"email":"alex@example.net"},"allowance":{"state":"ok","windows":[{"scope":"seven_day","label":"Weekly","used_percent":64.0},{"scope":"five_hour","window_minutes":300,"used_percent":20.0}]}},
             {"id":"w","provider":"claude","label":"Work","epoch":1,"state":"expired","identity":{"email":"w@x.com"},"allowance":null}]});
-        for (k, v) in [("accounts.inventory", inv.to_string()), ("allowance.claude", json!({"provider":"claude","state":"ok","email":"me@home.org","windows":[{"scope":"five_hour","used_percent":10.0},{"scope":"seven_day","used_percent":37.0}]}).to_string())] {
+        for (k, v) in [("accounts.inventory", inv.to_string()), ("allowance.claude", json!({"provider":"claude","state":"ok","email":"me@home.org","windows":[{"name":"5 h","scope":"shared","duration_minutes":300,"used_permille":100},{"name":"7 d","scope":"shared","duration_minutes":10080,"used_permille":370}]}).to_string())] {
             st.apply(&json!({"$":"SettingSet","key":k,"value":v,"at":2}));
         }
         let c = combo_of(&st, "t1", 100); assert_eq!(c["full"], "Opus 5.5 · auto · me · 63% left", "the CLI's own login: its email's name");
+        assert_eq!(c["windows"][0]["label"], "5-hour");
+        assert_eq!(c["windows"][1]["label"], "Weekly");
         st.apply(&json!({"$":"SettingSet","key":"account.thread.t1.claude","value":"{\"id\":\"k\",\"epoch\":2}","at":3}));
         let c = combo_of(&st, "t1", 100); assert_eq!(c["full"], "Opus 5.5 · auto · alex · 36% left"); assert_eq!(c["email"], "alex@example.net");
         let a = account_sections(&st, "t1", 100);
         assert_eq!(a[0]["choices"], json!([{"label":"Default (CLI login) · 63% left","value":"","on":false,"ok":true,"why":""},{"label":"alex@example.net · 36% left","value":"k\u{1f}2","on":true,"ok":true,"why":""},
             {"label":"Work","value":"w\u{1f}1","on":false,"ok":false,"why":"Sign-in expired. Sign in again in Settings, Accounts."}]));
         assert_eq!((a[1]["title"].clone(), a[1]["choices"][0]["label"].clone(), a[1]["choices"][0]["ok"].clone()), (json!("Usage"), json!("Weekly  36% left"), json!(false)));
+        assert_eq!(a[1]["choices"][1]["label"], "5-hour  80% left");
         st.apply(&json!({"$":"ThreadCreated","id":"t2","project":"p","title":"T","env":"local","branch":"","worktree":"","provider":"grok","model":"","at":1})); assert!(account_sections(&st, "t2", 100).is_empty());
     }
     /// a choice list without the fields the helper did not have (`note`, `efforts`)
